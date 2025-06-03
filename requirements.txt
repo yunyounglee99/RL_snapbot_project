@@ -1,0 +1,15 @@
+cvxpy==1.6.5
+glfw==2.9.0
+imageio==2.37.0
+matplotlib==3.10.3
+mujoco==3.1.1
+mujoco-python-viewer==0.1.4
+networkx==3.4.2
+numpy==1.24.3
+opencv-python==4.11.0.86
+scipy==1.15.3
+shapely==2.1.0
+torch==2.7.0
+torchaudio==2.7.0
+torchvision==0.22.0
+ipykernel
