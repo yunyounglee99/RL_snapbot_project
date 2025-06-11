@@ -133,8 +133,9 @@ class SnapbotGymClass():
             d = False
         
         # Compute forward reward
-        x_diff = p_torso_curr[0] - p_torso_prev[0] # x-directional displacement
-        r_forward = x_diff/self.dt
+        y_diff = p_torso_curr[1] - p_torso_prev[1] # x-directional displacement
+        TARGET_DIR = +1
+        r_side = TARGET_DIR * y_diff/self.dt
         
         # Check self-collision (excluding 'floor')
         p_contacts,f_contacts,geom1s,geom2s,_,_ = self.env.get_contact_info(must_exclude_prefix='floor')
@@ -152,17 +153,17 @@ class SnapbotGymClass():
             r_survive = 0.01
         
         # Heading reward
-        heading_vec = R_torso_curr[:,0] # x direction
-        r_heading = 0.01*np.dot(heading_vec,np.array([1,0,0]))
+        heading_vec = R_torso_curr[:,1] # x direction
+        r_heading = 0.01*np.dot(heading_vec,np.array([0,1,0]))
         if r_heading < 0.0:
             r_heading = r_heading*100.0 # focus more on penalizing going wrong direction
             
         # Lane keeping
-        lane_deviation = p_torso_curr[1] # y-directional displacement
+        lane_deviation = p_torso_curr[0] # y-directional displacement
         r_lane = -np.abs(lane_deviation)*0.5
         
         # Compute reward
-        r = np.array(r_forward+r_collision+r_survive+r_heading+r_lane)
+        r = np.array(r_side+r_collision+r_survive+r_heading+r_lane)
         
         # Accumulate state history (update 'state_history')
         self.accumulate_state_history()
@@ -172,8 +173,8 @@ class SnapbotGymClass():
         
         # Other information
         info = {'yaw_torso_deg_prev':yaw_torso_deg_prev,'yaw_torso_deg_curr':yaw_torso_deg_curr,
-                'x_diff':x_diff,'SELF_COLLISION':SELF_COLLISION,
-                'r_forward':r_forward,'r_collision':r_collision,'r_survive':r_survive,
+                'x_diff':y_diff,'SELF_COLLISION':SELF_COLLISION,
+                'r_side':r_side,'r_collision':r_collision,'r_survive':r_survive,
                 'r_heading':r_heading,'r_lane':r_lane}
         
         # Return
