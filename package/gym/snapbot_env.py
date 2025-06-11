@@ -13,13 +13,16 @@ class SnapbotGymClass:
         self.name = env.name
 
         # 1단계: 기본 변수들 먼저 초기화
+        self.phase = 'crouch'
         self.tick = 0
+        self.phase_tick = 0
         self.mujoco_nstep = max(1, int(self.env.HZ / self.HZ))
         self.contact_thr = 0.5
         
         # 2단계: get_state()에서 필요한 변수들 초기화
-        self.crouch_phase_ticks = int(2 * HZ)
-        self.push_phase_ticks = int(8 * HZ)
+        self.crouch_phase_ticks = int(1.5 * HZ)
+        self.push_phase_ticks = int(1.5 * HZ)
+        self.air_phase_ticks = int(1.5 * HZ)
         self.state_update_count = 0
         
         # 3단계: 임시 더미 상태로 차원 계산
@@ -57,6 +60,10 @@ class SnapbotGymClass:
         self.h_max_ep = 0.0
         self.air_time_ep = 0.0
         self.done_flag = False
+        self.foot_sensor_idxs = [
+            i for i, n in enumerate(self.env.sensor_names)
+            if n.endswith('_4')
+        ]
 
         if VERBOSE:
             print(f'[Snapbot Enhanced] a_dim:{self.a_dim} o_dim:{self.o_dim}')
@@ -126,7 +133,11 @@ class SnapbotGymClass:
     def _foot_contact(self):
         """접촉 감지 개선"""
         vals = self.env.get_sensor_values(sensor_names=self.env.sensor_names)
-        return np.any(vals > self.contact_thr)
+        return np.any(vals[self.foot_sensor_idxs] > self.contact_thr)
+    
+    def _feet_contact_ratio(self):
+        vals = self.env.get_sensor_values(sensor_names=self.env.sensor_names[:4])  # 발끝 4개
+        return np.mean(vals > self.contact_thr)
 
     def _foot_normal_z(self):
         """발바닥 법선 벡터 계산"""
@@ -187,8 +198,10 @@ class SnapbotGymClass:
         # 0) 준비
         # --------------------------------------------------
         self.tick += 1
+        self.phase_tick += 1
         r_sync = 0.0          # 디버깅용 기록 변수
         r_knee = 0.0
+        r_takeoff = 0.0
 
         # --------------------------------------------------
         # 1) 행동(4-D) → 안전 클리핑 → 8-D 패딩
@@ -242,38 +255,80 @@ class SnapbotGymClass:
         joint_vel  = (q_cur - q_prev) / self.dt
         knee_vel   = joint_vel[self.knee_slots]                       # (4,)
         torque     = self.env.data.actuator_force.flatten()[self.knee_slots]
+        target_z    = self.h_base - 0.03
+        knee_ang = -q_cur[self.knee_slots] * self.knee_dirs
+
+        # -------------------------------------------------
+        # 6.5) phase transfer
+        # -------------------------------------------------
+        if self.phase == 'crouch':
+            crouched = (h_cur <= target_z) or np.mean(knee_ang) > 0.5
+            if crouched and self.phase_tick >= self.crouch_phase_ticks:
+                self.phase = 'push'
+                self.phase_tick = 0
+        elif self.phase == 'push':
+            if (self._feet_contact_ratio() < 0.1) and (v_z > 0):
+                self.phase = 'air'
+                self.phase_tick = 0
+            elif self.phase_tick >= self.push_phase_ticks:
+                self.phase = 'crouch'
+                self.phase_tick = 0
+        elif self.phase == 'air':
+            if contact_cur and v_z <= 0 or self.phase_tick >= self.air_phase_ticks:
+                self.phase = 'crouch'
+                self.phase_tick = 0
 
         # --------------------------------------------------
         # 7) 단계별 보상
         # --------------------------------------------------
         r_phase = 0.0
-        if self.tick < self.crouch_phase_ticks:                       # Phase 0: crouch
-            z_feet = self._feet_z()
-            target = 0.25
-            r_phase = (-1.5 * abs(np.mean(z_feet) - target)
-                    - 0.8 * np.var(z_feet)
-                    + 1.2 * max(0, self.h_base - h_cur) * 2.0)
+        if self.phase == 'crouch':                       # Phase 0: crouch
+            depth_err = abs(h_cur - target_z)
 
-        elif self.tick < (self.crouch_phase_ticks + self.push_phase_ticks):  # Phase 1: push
-            # (a) ‘펴는 속도’ → knee_dirs 를 곱해 방향성 유지
-            ext_vel      = self.knee_dirs * knee_vel            # + : 펴는 방향
-            speed_mean   = np.mean(np.clip(ext_vel, 0, None))   # 펴는 속도만 +
-            speed_var    = np.var(ext_vel)                      # 펴는 속도 분산
-            r_speed      = 10.0 * speed_mean - 3.0 * speed_var
+            # knee_ang = -q_cur[self.knee_slots] * self.knee_dirs
+            sync_err = np.var(knee_ang)
 
-            # (b) ‘목표 각’ = 현각 + Δ(0.4 rad) 로 동적 설정
-            delta_goal   = 0.40                                 # 더 펴야 하는 양
-            knee_goal    = q_cur[self.knee_slots] + self.knee_dirs * delta_goal
-            err_knee     = self.knee_dirs * (knee_goal - q_cur[self.knee_slots])
-            r_knee       = 6.0 * np.mean(np.clip(err_knee, 0, None))  # 진행률 0~1
+            r_phase = (
+                -5.0 * depth_err
+                -2.0 * sync_err
+                -0.01 * self.phase_tick
+            )
 
-            # r_n          = 2.0 * np.mean(self._foot_normal_z())
-            r_takeoff    = 4.0 * v_z if (contact_prev and not contact_cur and v_z > 0) else 0.0
+        elif self.phase == 'push':  # Phase 1: push
+            # -------------------------------------------------
+            # (a) 무릎 펴는 속도 보상
+            ext_vel     = self.knee_dirs * knee_vel          # + : 펴는 방향
+            speed_mean  = np.mean(np.clip(ext_vel, 0, None))
+            speed_var   = np.var(ext_vel)
+            r_speed     = 80.0 * speed_mean - 30.0 * speed_var
 
-            r_phase      = r_speed + r_knee + r_takeoff # + r_n
-            r_sync       = r_speed          # 디버그 출력
+            # -------------------------------------------------
+            # (b) 무릎 각도 진행률 보상
+            ctrl_hi = self.env.ctrl_ranges[self.knee_slots, 1]
+            knee_goal = ctrl_hi - 0.03     
+            err_knee    = self.knee_dirs * (knee_goal - q_cur[self.knee_slots])
+            r_knee      = 6.0 * np.mean(np.clip(err_knee, 0, None))
 
-        else:                                                   # Phase 2: air / landing
+            # -------------------------------------------------
+            # (c) **너무 낮게 앉아 있으면 패널티*
+
+            # -------------------------------------------------
+            # (d) 이륙 순간 보너스
+            if (contact_prev and not contact_cur and v_z > 0): 
+                r_takeoff = 100.0 * v_z * (1.0 + max(0.0, h_cur - self.h_base))
+
+                h_gain = h_cur - self.h_base
+                r_takeoff += 300*h_gain
+            else: 
+                h_gain = h_cur - self.h_base
+                r_takeoff += 100*h_gain
+
+            # -------------------------------------------------
+            # 총 push-phase 보상
+            r_phase  = r_speed + r_knee + r_takeoff   # (+ r_n)
+            r_sync   = r_speed     # 디버깅용
+
+        elif self.phase == 'air':                                                   # Phase 2: air / landing
             r_jump    = 5.0 * self._reward_jump(h_cur, v_z, contact_cur, roll_pen)
             r_landing = 10.0 * max(0.0, np.dot(R_cur[:, 2], [0, 0, 1]))
             r_phase   = r_jump + r_landing
@@ -281,11 +336,11 @@ class SnapbotGymClass:
         # --------------------------------------------------
         # 8) 기타 보상
         # --------------------------------------------------
-        r_energy    = self._reward_energy(torque, action_knee)      # 4-D 사용
+        # r_energy    = self._reward_energy(torque, action_knee)      # 4-D 사용
         r_collision = -15.0 if len(self.env.get_contact_info(must_exclude_prefix='floor')[2]) else 0.0
         r_survive   = -15.0 if ROLLOVER else 0.02
 
-        reward = float(np.clip(r_phase + r_energy + r_collision + r_survive, -100, 100))
+        reward = float(np.clip(r_phase + r_collision + r_survive, -300, 300))
 
         # --------------------------------------------------
         # 9) 기록 및 반환
@@ -303,7 +358,8 @@ class SnapbotGymClass:
                     v_z         = v_z,
                     r_phase     = r_phase,
                     r_sync      = r_sync,
-                    r_knee      = r_knee)
+                    r_knee      = r_knee,
+                    r_takeoff   = r_takeoff)
 
         self.action_prev = action_knee.copy()
         return self.get_observation(), reward, done, info
