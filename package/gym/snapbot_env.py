@@ -50,6 +50,10 @@ class SnapbotGymClass:
         
         self.knee_slots = [1, 3, 5, 7]
         self.knee_dirs = np.array([1, 1, 1, 1], dtype=float)
+        self.knee_bodies = [
+            'Leg_module_1_2', 'Leg_module_2_2',
+            'Leg_module_4_2', 'Leg_module_5_2'
+        ] 
         self.a_dim  = len(self.knee_slots)
         self.action_prev = np.zeros(self.a_dim)
 
@@ -136,7 +140,8 @@ class SnapbotGymClass:
         return np.any(vals[self.foot_sensor_idxs] > self.contact_thr)
     
     def _feet_contact_ratio(self):
-        vals = self.env.get_sensor_values(sensor_names=self.env.sensor_names[:4])  # 발끝 4개
+        vals = np.nan_to_num(self.env.get_sensor_values(sensor_names=self.env.sensor_names), nan=0.0, posinf=1e6, neginf=-1e6)
+        vals = vals[self.foot_sensor_idxs]        # 4개
         return np.mean(vals > self.contact_thr)
 
     def _foot_normal_z(self):
@@ -192,176 +197,113 @@ class SnapbotGymClass:
                 8e-3 * np.sum((action - self.action_prev) ** 2))
 
     def step(self, action, max_time=np.inf):
-        """무릎 관절(4 DoF)만으로 점프하도록 수정한 step 함수"""
+        """최소-피쳐(high-jump) step: 다리 모터 조건 제거"""
 
-        # --------------------------------------------------
-        # 0) 준비
-        # --------------------------------------------------
-        self.tick += 1
+        # ── 프레임 카운터 ────────────────────────────────
+        self.tick       += 1
         self.phase_tick += 1
-        r_sync = 0.0          # 디버깅용 기록 변수
-        r_knee = 0.0
+        r_phase = 0.0
         r_takeoff = 0.0
 
-        # --------------------------------------------------
-        # 1) 행동(4-D) → 안전 클리핑 → 8-D 패딩
-        # --------------------------------------------------
-        action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)     # (4,)
-        lo = self.env.ctrl_ranges[self.knee_slots, 0]
-        hi = self.env.ctrl_ranges[self.knee_slots, 1]
-        action_knee = np.clip(action, lo, hi)                                # (4,)
+        # ── 1. 액션 (4)   → 클리핑 → 풀 액션(8) 패딩 ───
+        a_knee = np.clip(
+            np.nan_to_num(action), 
+            *self.env.ctrl_ranges[self.knee_slots].T
+        )
+        a_full = np.zeros(len(self.env.ctrl_qpos_idxs))
+        a_full[self.knee_slots] = a_knee
 
-        action_full = np.zeros(len(self.env.ctrl_qpos_idxs))                 # (8,)
-        action_full[self.knee_slots] = action_knee
-
-        # --------------------------------------------------
-        # 2) 이전 상태 저장
-        # --------------------------------------------------
-        p_prev = self.env.get_p_body('torso')
-        q_prev = self.env.data.qpos[self.env.ctrl_qpos_idxs].copy()
+        # ── 2. 이전 상태 저장 ────────────────────────────
+        p_prev  = self.env.get_p_body('torso')
         contact_prev = self._foot_contact()
 
-        # --------------------------------------------------
-        # 3) 시뮬레이션 실행
-        # --------------------------------------------------
-        self.env.step(ctrl=action_full, nstep=self.mujoco_nstep)
+        # ── 3. 시뮬레이션 진행 ───────────────────────────
+        self.env.step(ctrl=a_full, nstep=self.mujoco_nstep)
 
-        # --------------------------------------------------
-        # 4) 현재 상태 계산
-        # --------------------------------------------------
-        p_cur  = self.env.get_p_body('torso')
-        R_cur  = self.env.get_R_body('torso')
-        q_cur  = self.env.data.qpos[self.env.ctrl_qpos_idxs].copy()
+        # ── 4. 현재 상태 ────────────────────────────────
+        p_cur   = self.env.get_p_body('torso')
+        R_cur   = self.env.get_R_body('torso')
         contact_cur = self._foot_contact()
 
-        # --------------------------------------------------
-        # 5) 종료 조건
-        # --------------------------------------------------
-        ROLLOVER      = np.dot(R_cur[:, 2], [0, 0, 1]) < 0.15
-        OUT_OF_BOUNDS = abs(p_cur[0]) > 5.0 or abs(p_cur[1]) > 5.0
-        self.done_flag = done = (self.get_sim_time() >= max_time) or ROLLOVER or OUT_OF_BOUNDS
+        # ── 5. 종료 조건 ────────────────────────────────
+        rollover   = np.dot(R_cur[:, 2], [0, 0, 1]) < 0.15
+        out_bounds = np.any(np.abs(p_cur[:2]) > 5.0)
+        done = self.done_flag = rollover or out_bounds or (self.get_sim_time() >= max_time)
 
-        # --------------------------------------------------
-        # 6) 동역학 & 기록
-        # --------------------------------------------------
+        # ── 6. 파생량 ───────────────────────────────────
         h_cur  = p_cur[2]
         v_z    = (h_cur - p_prev[2]) / self.dt
-        self.h_max     = max(self.h_max, h_cur)
-        self.h_max_ep  = max(self.h_max_ep, h_cur)
+        self.h_max    = max(self.h_max, h_cur)
+        self.h_max_ep = max(self.h_max_ep, h_cur)
         if not contact_cur:
             self.air_time_ep += self.dt
 
-        roll_pen   = 1 - np.dot(R_cur[:, 2], [0, 0, 1])
-        joint_vel  = (q_cur - q_prev) / self.dt
-        knee_vel   = joint_vel[self.knee_slots]                       # (4,)
-        torque     = self.env.data.actuator_force.flatten()[self.knee_slots]
-        target_z    = self.h_base - 0.03
-        knee_ang = -q_cur[self.knee_slots] * self.knee_dirs
-
-        # -------------------------------------------------
-        # 6.5) phase transfer
-        # -------------------------------------------------
+        # ── 7. phase 전이 ───────────────────────────────
+        target_z = self.h_base - 0.03
         if self.phase == 'crouch':
-            crouched = (h_cur <= target_z) or np.mean(knee_ang) > 0.5
-            if crouched and self.phase_tick >= self.crouch_phase_ticks:
-                self.phase = 'push'
-                self.phase_tick = 0
+            if (h_cur <= target_z) and self.phase_tick >= self.crouch_phase_ticks:
+                self.phase = 'push'; self.phase_tick = 0
         elif self.phase == 'push':
-            if (self._feet_contact_ratio() < 0.1) and (v_z > 0):
+            if (self._feet_contact_ratio() < 0.1 and v_z > 0):
                 self.phase = 'air'
                 self.phase_tick = 0
             elif self.phase_tick >= self.push_phase_ticks:
                 self.phase = 'crouch'
                 self.phase_tick = 0
         elif self.phase == 'air':
-            if contact_cur and v_z <= 0 or self.phase_tick >= self.air_phase_ticks:
-                self.phase = 'crouch'
-                self.phase_tick = 0
+            if (contact_cur and v_z <= 0) or self.phase_tick >= self.air_phase_ticks:
+                self.phase = 'crouch'; self.phase_tick = 0
 
-        # --------------------------------------------------
-        # 7) 단계별 보상
-        # --------------------------------------------------
-        r_phase = 0.0
-        if self.phase == 'crouch':                       # Phase 0: crouch
+        # ── 8. 보상 계산 ───────────────────────────────
+        if self.phase == 'crouch':
             depth_err = abs(h_cur - target_z)
+            r_phase   = -10.0 * depth_err - 0.01 * self.phase_tick
 
-            # knee_ang = -q_cur[self.knee_slots] * self.knee_dirs
-            sync_err = np.var(knee_ang)
+        elif self.phase == 'push':
+            r_takeoff =  100.0 * max(0, v_z)                     # 속도
+            r_takeoff += 300.0 * max(0, h_cur - self.h_base)     # 즉시 높이
+            r_phase   = r_takeoff
 
-            r_phase = (
-                -5.0 * depth_err
-                -2.0 * sync_err
-                -0.01 * self.phase_tick
-            )
+        else:  # air
+            upright = np.dot(R_cur[:, 2], [0, 0, 1])
+            height_gain = max(0.0, h_cur - self.h_base)
+            r_phase = 8.0 * height_gain ** 1.5 + 5.0 * upright
 
-        elif self.phase == 'push':  # Phase 1: push
-            # -------------------------------------------------
-            # (a) 무릎 펴는 속도 보상
-            ext_vel     = self.knee_dirs * knee_vel          # + : 펴는 방향
-            speed_mean  = np.mean(np.clip(ext_vel, 0, None))
-            speed_var   = np.var(ext_vel)
-            r_speed     = 80.0 * speed_mean - 30.0 * speed_var
+        # (옵션) 충돌·생존만 남김 + **몸통-바닥 충돌 패널티**
+        p_contacts,f_contacts,geom1s,geom2s,body1s,body2s = self.env.get_contact_info()
 
-            # -------------------------------------------------
-            # (b) 무릎 각도 진행률 보상
-            ctrl_hi = self.env.ctrl_ranges[self.knee_slots, 1]
-            knee_goal = ctrl_hi - 0.03     
-            err_knee    = self.knee_dirs * (knee_goal - q_cur[self.knee_slots])
-            r_knee      = 6.0 * np.mean(np.clip(err_knee, 0, None))
+        # ‘torso’ 와 ‘floor’ 가 맞부딪혔는지 검사
+        torso_floor_hit = any(
+            (('torso' in (body1s[i], body2s[i])) and ('floor' in (body1s[i], body2s[i])))
+            for i in range(len(body1s))
+        )
 
-            # -------------------------------------------------
-            # (c) **너무 낮게 앉아 있으면 패널티*
+        knee_floor_hit = any(
+            ( (body1s[i] in self.knee_bodies and body2s[i] == 'floor') or
+            (body2s[i] in self.knee_bodies and body1s[i] == 'floor') )
+            for i in range(len(body1s))
+        )
 
-            # -------------------------------------------------
-            # (d) 이륙 순간 보너스
-            if (contact_prev and not contact_cur and v_z > 0): 
-                r_takeoff = 100.0 * v_z * (1.0 + max(0.0, h_cur - self.h_base))
+        # (옵션) 충돌·생존만 남김
+        r_torso_floor = -100.0 if torso_floor_hit else 0.0
+        r_knee_floor  = -100.0  if knee_floor_hit  else 0.0
+        r_collision = -15.0 if self.env.get_contact_info(must_exclude_prefix='floor')[2] else 0.0
+        r_survive   = -15.0 if rollover else 0.02
+        reward      = float(np.clip(r_phase + r_collision + r_survive, -300, 300))
 
-                h_gain = h_cur - self.h_base
-                r_takeoff += 300*h_gain
-            else: 
-                h_gain = h_cur - self.h_base
-                r_takeoff += 100*h_gain
-
-            # -------------------------------------------------
-            # 총 push-phase 보상
-            r_phase  = r_speed + r_knee + r_takeoff   # (+ r_n)
-            r_sync   = r_speed     # 디버깅용
-
-        elif self.phase == 'air':                                                   # Phase 2: air / landing
-            r_jump    = 5.0 * self._reward_jump(h_cur, v_z, contact_cur, roll_pen)
-            r_landing = 10.0 * max(0.0, np.dot(R_cur[:, 2], [0, 0, 1]))
-            r_phase   = r_jump + r_landing
-
-        # --------------------------------------------------
-        # 8) 기타 보상
-        # --------------------------------------------------
-        # r_energy    = self._reward_energy(torque, action_knee)      # 4-D 사용
-        r_collision = -15.0 if len(self.env.get_contact_info(must_exclude_prefix='floor')[2]) else 0.0
-        r_survive   = -15.0 if ROLLOVER else 0.02
-
-        reward = float(np.clip(r_phase + r_collision + r_survive, -300, 300))
-
-        # --------------------------------------------------
-        # 9) 기록 및 반환
-        # --------------------------------------------------
+        # ── 9. 히스토리 및 반환 ────────────────────────
         self.accumulate_state_history()
-        phase_name = ('crouch' if self.tick < self.crouch_phase_ticks else
-                    'push'  if self.tick < (self.crouch_phase_ticks + self.push_phase_ticks)
-                    else 'air')
-
-        info = dict(h_curr      = h_cur,
-                    h_max_ep    = self.h_max_ep,
-                    air_time_ep = self.air_time_ep,
-                    phase       = phase_name,
-                    contact     = contact_cur,
-                    v_z         = v_z,
-                    r_phase     = r_phase,
-                    r_sync      = r_sync,
-                    r_knee      = r_knee,
-                    r_takeoff   = r_takeoff)
-
-        self.action_prev = action_knee.copy()
+        info = dict(
+            h_curr=h_cur, 
+            h_max_ep=self.h_max_ep, 
+            air_time_ep=self.air_time_ep,
+            phase=self.phase, 
+            contact=contact_cur, 
+            v_z=v_z,
+            r_phase=r_phase,
+            r_takeoff = r_takeoff
+        )
+        self.action_prev = a_knee.copy()
         return self.get_observation(), reward, done, info
 
     def reset(self):
@@ -419,9 +361,8 @@ class SnapbotGymClass:
             
         # 디버그 정보 표시
         if PLOT_DEBUG:
-            phase_name = ('CROUCH' if self.tick < self.crouch_phase_ticks else
-                        'PUSH' if self.tick < (self.crouch_phase_ticks + self.push_phase_ticks)
-                        else 'AIR')
+            phase_name = self.phase.upper()
+
             debug_text = f"Phase: {phase_name} | H_max: {self.h_max_ep:.2f}m"
             p_torso, R_torso = self.env.get_pR_body(body_name='torso')
             self.env.plot_T(p=p_torso + 0.35 * R_torso[:, 2], R=np.eye(3, 3),
