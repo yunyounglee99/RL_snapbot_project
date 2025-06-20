@@ -132,7 +132,7 @@ class SnapbotGymClass():
         else:
             d = False
         
-        # Compute forward reward
+        # Compute sidewalk reward
         y_diff = p_torso_curr[1] - p_torso_prev[1] # x-directional displacement
         TARGET_DIR = +1
         r_side = TARGET_DIR * y_diff/self.dt
@@ -173,7 +173,7 @@ class SnapbotGymClass():
         
         # Other information
         info = {'yaw_torso_deg_prev':yaw_torso_deg_prev,'yaw_torso_deg_curr':yaw_torso_deg_curr,
-                'x_diff':y_diff,'SELF_COLLISION':SELF_COLLISION,
+                'y_diff':y_diff,'SELF_COLLISION':SELF_COLLISION,
                 'r_side':r_side,'r_collision':r_collision,'r_survive':r_survive,
                 'r_heading':r_heading,'r_lane':r_lane}
         
