@@ -20,6 +20,7 @@ class SnapbotGymClass():
         self.history_intv_sec  = history_intv_sec
         self.history_intv_tick = int(self.HZ*self.history_intv_sec) # interval between state in history
         self.history_ticks     = np.arange(0,self.n_history,self.history_intv_tick)
+        self.h_base = env.get_p_body('torso')[2]
         
         self.mujoco_nstep      = self.env.HZ // self.HZ # nstep for MuJoCo step
         self.VERBOSE           = VERBOSE
@@ -120,7 +121,9 @@ class SnapbotGymClass():
         # ========== 3. 보상 항목 수정 ==========
         # 3-1) ‘수직 상승’ 보상  (기존 r_forward → r_vertical)
         z_diff      = p_cur[2] - p_prev[2]               # ↑ 방향 변위
-        r_vertical  = 5 * z_diff / self.dt if z_diff > 0 else z_diff / self.dt                  # 순간 상승 속도
+        # r_vertical  = 5 * z_diff / self.dt if z_diff > 0 else z_diff / self.dt                  # 순간 상승 속도
+        r_vertical = 5 * (np.clip(np.exp(z_diff/self.dt), 0.0, 300.0)) if z_diff > 0 else z_diff / self.dt
+        r_height = 80.0 * (max(0.0, np.clip(np.exp(p_cur[2] - self.h_base)-1, 0.0, 500.0)))
 
         # 3-2) 힙 고정 패널티  (각도 제곱합/속도 제곱합 둘 중 하나 선택)
         hip_idx  = [0, 2, 4, 6]                          # ctrl_qpos 순서
@@ -136,7 +139,7 @@ class SnapbotGymClass():
         qvel_knee = self.env.data.qvel[self.env.ctrl_qpos_idxs][knee_idx]
 
         knee_bon_ang = 0.4 * np.sum(qpos_knee**2)
-        knee_bon_vel = 0.4 * np.sum((qvel_knee/10.0)**2)
+        knee_bon_vel = 0.2 * np.sum((qvel_knee/10.0)**2)
 
         # 3-3) 기존 항목에서 forward / heading / lane 제거
         #     → r = r_vertical + …만 사용
@@ -147,7 +150,7 @@ class SnapbotGymClass():
             d = False
         r_survive = -10.0 if ROLLOVER else 0.01
 
-        r = r_vertical + knee_bon_ang + knee_bon_vel + r_survive + hip_pen_ang + hip_pen_vel
+        r = r_height + r_survive + hip_pen_ang + hip_pen_vel#+ knee_bon_ang + knee_bon_vel  # + r_vertical
         r = np.array(r)
         
         # Accumulate state history (update 'state_history')
@@ -163,6 +166,7 @@ class SnapbotGymClass():
             'h_cur'       : p_cur[2],
             'z_diff'      : z_diff,          # 이번 스텝에서 상승한 거리
             'v_z'         : r_vertical,      # 순간 수직 속도 (= 보상 전용)
+            'r_height' : r_height,
 
             # 힙 고정 패널티 항목
             'hip_pen_ang' : hip_pen_ang,
@@ -228,6 +232,7 @@ class SnapbotGymClass():
         self.tick = 0
         # Reset env
         self.env.reset(step=True)
+        self.h_base = self.env.get_p_body('torso')[2]
         # Reset history
         self.state_history = np.zeros((self.n_history,self.state_dim))
         self.tick_history  = np.zeros((self.n_history,1))
