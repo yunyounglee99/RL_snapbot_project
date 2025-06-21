@@ -107,31 +107,23 @@ class SnapbotGymClass():
         return action
         
     def step(self,a,max_time=np.inf):
-        # ── 0) 공통: 이전 상태 저장 ──────────────────────────────────
         self.tick += 1
         p_prev = self.env.get_p_body('torso')
 
-        # ── 1) 시뮬레이션 실행 ─────────────────────────────────────
         self.env.step(ctrl=a, nstep=self.mujoco_nstep)
 
-        # ── 2) 현재 상태 ──────────────────────────────────────────
         p_cur = self.env.get_p_body('torso')
         R_cur = self.env.get_R_body('torso')
 
-        # ========== 3. 보상 항목 수정 ==========
-        # 3-1) ‘수직 상승’ 보상  (기존 r_forward → r_vertical)
         z_diff      = p_cur[2] - p_prev[2]
         # r_vertical  = 5 * z_diff / self.dt if z_diff > 0 else z_diff / self.dt
         # r_vertical = 5 * (np.clip(np.exp(z_diff/self.dt), 0.0, 300.0)) if z_diff > 0 else z_diff / self.dt
         r_height = 200.0 * np.clip(np.exp(p_cur[2] - self.h_base)-1, 0.0, 500.0)
 
-        # 3-2) 힙 고정 패널티  (각도 제곱합/속도 제곱합 둘 중 하나 선택)
-        hip_idx  = [0, 2, 4, 6]                          # ctrl_qpos 순서
+        hip_idx  = [0, 2, 4, 6]
         qpos     = self.env.data.qpos[self.env.ctrl_qpos_idxs][hip_idx]
         qvel     = self.env.data.qvel[self.env.ctrl_qvel_idxs][hip_idx]
-        # 각도 기준: 너무 벌어지면 패
-        hip_pen_ang = -0.2 * np.sum(qpos**2)             # 계수는 임의–조절
-        # 속도 기준: 꿈틀거리면 패
+        hip_pen_ang = -0.2 * np.sum(qpos**2)
         hip_pen_vel = -0.1 * np.sum((qvel/10.0)**2)
 
         knee_idx = [1, 3, 5, 7]
@@ -141,8 +133,6 @@ class SnapbotGymClass():
         knee_bon_ang = 0.4 * np.sum(qpos_knee**2)
         knee_bon_vel = 0.2 * np.sum((qvel_knee/10.0)**2)
 
-        # 3-3) 기존 항목에서 forward / heading / lane 제거
-        #     → r = r_vertical + …만 사용
         ROLLOVER = (np.dot(R_cur[:,2],np.array([0,0,1]))<0.0)
         if (self.get_sim_time() >= max_time) or ROLLOVER:
             d = True
