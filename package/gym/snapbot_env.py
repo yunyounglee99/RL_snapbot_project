@@ -107,39 +107,47 @@ class SnapbotGymClass():
         return action
         
     def step(self,a,max_time=np.inf):
-        # ── 0) 공통: 이전 상태 저장 ──────────────────────────────────
         self.tick += 1
         p_prev = self.env.get_p_body('torso')
 
-        # ── 1) 시뮬레이션 실행 ─────────────────────────────────────
         self.env.step(ctrl=a, nstep=self.mujoco_nstep)
 
-        # ── 2) 현재 상태 ──────────────────────────────────────────
         p_cur = self.env.get_p_body('torso')
         R_cur = self.env.get_R_body('torso')
 
-        # ========== 3. 보상 항목 수정 ==========
-        h = p_cur[2] - self.h_base
-        x = p_cur[0]
-        y = p_cur[1]
-        in_air = np.all(self.env.get_sensor_values() < 0.2)
+        z_diff = p_cur[2] - p_prev[2]
+        # r_vertical  = 5 * z_diff / self.dt if z_diff > 0 else z_diff / self.dt
+        # r_vertical = 5 * (np.clip(np.exp(z_diff/self.dt), 0.0, 300.0)) if z_diff > 0 else z_diff / self.dt
+        r_height = 200.0 * np.clip(np.exp(p_cur[2] - self.h_base)-1, 0.0, 500.0)
+        r_forward = 400.0 * np.clip(np.exp(p_cur[0] - p_prev[0])-1, 0.0, 500.0) if p_cur[2] - self.h_base > 0.0 else 0.0
+        lane_deviation = p_cur[1] # y-directional displacement
+        r_lane = -np.abs(lane_deviation)*0.5
 
-        r_jump = 200.0 * (np.clip(h * (np.exp(x)-1.0), 0.0, 100.0)) if h > 0.00 else - abs(h) * abs(x)
-        r_lane = -20.0 * y**2
-        r_back = -50.0 * abs(x) if x < 0 else 0.0
+        hip_idx  = [0, 2, 4, 6]
+        qpos = self.env.data.qpos[self.env.ctrl_qpos_idxs][hip_idx]
+        qvel = self.env.data.qvel[self.env.ctrl_qvel_idxs][hip_idx]
+        hip_pen_ang = -0.2 * np.sum(qpos**2)
+        hip_pen_vel = -0.1 * np.sum((qvel/10.0)**2)
+
+        knee_idx = [1, 3, 5, 7]
+        qpos_knee = self.env.data.qpos[self.env.ctrl_qpos_idxs][knee_idx]
+        qvel_knee = self.env.data.qvel[self.env.ctrl_qpos_idxs][knee_idx]
+
+        knee_bon_ang = 0.4 * np.sum(qpos_knee**2)
+        knee_bon_vel = 0.2 * np.sum((qvel_knee/10.0)**2)
 
         ROLLOVER = (np.dot(R_cur[:,2],np.array([0,0,1]))<0.0)
         if (self.get_sim_time() >= max_time) or ROLLOVER:
             d = True
         else:
             d = False
-        r_survive = -500.0 if ROLLOVER else 0.01
+        r_survive = -10.0 if ROLLOVER else 0.01
 
         p_contacts,f_contacts,geom1s,geom2s,_,_ = self.env.get_contact_info(must_exclude_prefix='floor')
         SELF_COLLISION = 1 if len(geom1s) > 0 else 0
         r_collision = -10 if SELF_COLLISION else 0
 
-        r = r_jump + r_lane + r_back + r_survive + r_collision
+        r = r_height + r_survive + r_collision + hip_pen_ang + hip_pen_vel + r_forward + r_lane#+ knee_bon_ang + knee_bon_vel  # + r_vertical
         r = np.array(r)
         
         # Accumulate state history (update 'state_history')
@@ -152,9 +160,14 @@ class SnapbotGymClass():
         info = {
             # 높이·속도
             'h_prev'      : p_prev[2],
-            'h_cur'       : h,
-            'x_cur' : x,
-            'r_jump'      : r_jump,          # 이번 스텝에서 상승한 거리
+            'h_cur'       : p_cur[2],
+            'x_diff'      : p_prev[0]-p_cur[0],
+            'r_height' : r_height,
+            'r_forward' : r_forward,
+
+            # 힙 고정 패널티 항목
+            'hip_pen_ang' : hip_pen_ang,
+            'hip_pen_vel' : hip_pen_vel,
 
             # 생존 여부
             'rollover'    : ROLLOVER,
