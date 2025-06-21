@@ -123,7 +123,7 @@ class SnapbotGymClass():
         z_diff      = p_cur[2] - p_prev[2]               # ↑ 방향 변위
         # r_vertical  = 5 * z_diff / self.dt if z_diff > 0 else z_diff / self.dt                  # 순간 상승 속도
         r_vertical = 5 * (np.clip(np.exp(z_diff/self.dt), 0.0, 300.0)) if z_diff > 0 else z_diff / self.dt
-        r_height = 80.0 * (max(0.0, np.clip(np.exp(p_cur[2] - self.h_base)-1, 0.0, 500.0)))
+        r_height = 200.0 * (max(0.0, np.clip(np.exp(p_cur[2] - self.h_base)-1, 0.0, 500.0)))
 
         # 3-2) 힙 고정 패널티  (각도 제곱합/속도 제곱합 둘 중 하나 선택)
         hip_idx  = [0, 2, 4, 6]                          # ctrl_qpos 순서
@@ -150,7 +150,11 @@ class SnapbotGymClass():
             d = False
         r_survive = -10.0 if ROLLOVER else 0.01
 
-        r = r_height + r_survive + hip_pen_ang + hip_pen_vel#+ knee_bon_ang + knee_bon_vel  # + r_vertical
+        p_contacts,f_contacts,geom1s,geom2s,_,_ = self.env.get_contact_info(must_exclude_prefix='floor')
+        SELF_COLLISION = 1 if len(geom1s) > 0 else 0
+        r_collision = -10 if SELF_COLLISION else 0
+
+        r = r_height + r_survive + r_collision + hip_pen_ang + hip_pen_vel#+ knee_bon_ang + knee_bon_vel  # + r_vertical
         r = np.array(r)
         
         # Accumulate state history (update 'state_history')
@@ -174,6 +178,7 @@ class SnapbotGymClass():
 
             # 생존 여부
             'rollover'    : ROLLOVER,
+            'self_collision' : SELF_COLLISION,
             'r_survive'   : r_survive,
 
             # 최종 스텝별 보상
