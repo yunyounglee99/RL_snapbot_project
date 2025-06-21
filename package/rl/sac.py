@@ -149,6 +149,7 @@ class ActorClass(nn.Module):
         mean = self.layers['mu'](x)
         # std  = F.softplus(self.layers['std'](x)) + 1e-6
         std = torch.sigmoid(self.layers['std'](x))
+        std = torch.clamp(std,  min=1e-6, max=1.0)
         # Define Gaussian
         GaussianDistribution = Normal(mean, std)
         # Sample action
